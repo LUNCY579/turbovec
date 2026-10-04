@@ -483,10 +483,10 @@ pub(crate) struct SyncSource<'a> {
     pub n_vectors: usize,
     /// Sequential-blocked codes for whole blocks `[from, to)` (row
     /// indexes, multiples of 32).
-    pub seq_blocks: &'a dyn Fn(usize, usize) -> Vec<u8>,
+    pub seq_blocks: &'a (dyn Fn(usize, usize) -> Vec<u8> + Sync),
     /// Append one row's sequential codes to the buffer (tail rows
     /// and redo ops).
-    pub row_codes: &'a dyn Fn(usize, &mut Vec<u8>),
+    pub row_codes: &'a (dyn Fn(usize, &mut Vec<u8>) + Sync),
     pub scales: &'a [f32],
     /// slot → external id; `Some` iff kind 1.
     pub ids: Option<&'a [u64]>,
@@ -906,8 +906,15 @@ fn write_image<W: Write>(w: &mut W, src: &SyncSource<'_>, gen: u64, nonce: u64) 
     w.write_all(&h)?;
     w.write_all(&vec![0u8; geo.hdr_len() - h.len()])?;
     w.write_all(&vec![0u8; geo.hdr_len()])?;
-    for b in 0..n_blocks {
-        w.write_all(&unit_bytes(src, b))?;
+    // Units are built a batch at a time across the pool — a planes
+    // cache converts each block back to its stored form on the way —
+    // and written in order; the bytes are the same as one at a time.
+    const UNITS_PER_BATCH: usize = 256;
+    for b0 in (0..n_blocks).step_by(UNITS_PER_BATCH) {
+        let b1 = (b0 + UNITS_PER_BATCH).min(n_blocks);
+        for u in crate::pack::par_map_blocks(b0..b1, &|b| unit_bytes(src, b)) {
+            w.write_all(&u)?;
+        }
     }
     Ok(())
 }

@@ -188,27 +188,27 @@ Common use cases:
 
 ---
 
-## Two-stage 2-bit search (opt-in)
+## Two-stage 2-bit search
 
-Setting `TURBOVEC_2BIT_PLANES=1` in the environment before the process first searches switches 2-bit indexes of 32,768 vectors or more to a two-stage search. It is off by default, read once per process, and changes nothing on disk: files written with it on or off are byte-identical, and either setting loads either file.
+A 2-bit index of 32,768 vectors or more searches in two stages. Nothing changes on disk: the file is the same whichever way it is searched. `TURBOVEC_2BIT_PLANES=0` in the environment before the process first searches keeps the whole-index exact scan instead; it is read once per process.
 
-A 2-bit code is a sign bit and a magnitude bit per coordinate. With the switch on, the in-memory search cache holds the two bits apart — the same bytes per vector, arranged differently — and a search
+A 2-bit code is a sign bit and a magnitude bit per coordinate. The in-memory search cache holds the two bits apart — the same bytes per vector, arranged differently — and a search
 
 1. scans the sign bits alone (half the bytes of a full scan) for a shortlist of `max(128, 12.8 × k)` candidates,
 2. ranks the shortlist with an estimate that adds the magnitude bits (a bit-count against the query rounded to 6 bits per coordinate), and
 3. rescores the best `max(32, 2 × k)` with the exact scan's own arithmetic.
 
-**Scores are exact; the candidate set is approximate.** Every returned score is bit-identical to what the default scan returns for that id. What can differ is *which* ids are returned: a vector whose sign bits alone rank it outside the shortlist is not seen. How often that happens depends on the data:
+**Scores are exact; the candidate set is approximate.** Every returned score is bit-identical to what the whole-index scan returns for that id. What can differ is *which* ids are returned: a vector whose sign bits alone rank it outside the shortlist is not seen. How often that happens depends on the data:
 
-| data | queries returning exactly the default scan's ids |
+| data | queries returning exactly the whole-index scan's ids |
 |---|---|
 | OpenAI `text-embedding-3` d=1536 and d=3072, N=200K, k = 1, 10, 100 | 99.99–100% of 10,000 |
 | `all-mpnet-base-v2` d=768, N=41K, k = 1, 10, 100 | 99.95–100% of 10,000 |
 | isotropic random unit vectors, d=64–1536, N=50K, k=10 | 4–7% (75% of ids shared) |
 
-Recall against float ground truth on the OpenAI corpora is unchanged at every k the benchmark suite reports. On random vectors — where a query has no real neighbours and the top-k is decided by noise-sized margins — the true nearest neighbour is in the top 10 for 74% of queries at d=768, against 86% with the default scan. Turn the switch on for embedding workloads, and check agreement on your own data if it is unlike the corpora above.
+Recall against float ground truth on the OpenAI corpora is unchanged at every k the benchmark suite reports. On random vectors — where a query has no real neighbours and the top-k is decided by noise-sized margins — the true nearest neighbour is in the top 10 for 74% of queries at d=768, against 86% with the whole-index scan. Check agreement on your own data if it is unlike the corpora above, and set `TURBOVEC_2BIT_PLANES=0` if the whole-index scan's id set is what you need.
 
-**When it is faster.** The first stage is cheaper than a full scan, and the later stages cost more as `k` grows, so the gain is largest for small `k`. Milliseconds per query on 100K OpenAI d=1536 vectors, 1,000 queries, default → switch on:
+**When it is faster.** The first stage is cheaper than a full scan, and the later stages cost more as `k` grows, so the gain is largest for small `k`. Milliseconds per query on 100K OpenAI d=1536 vectors, 1,000 queries, whole-index scan → two-stage:
 
 | | k=10 | k=64 | k=100 |
 |---|---|---|---|
@@ -221,9 +221,50 @@ Recall against float ground truth on the OpenAI corpora is unchanged at every k 
 | x86 (c3), 8 threads, batch | 0.137 → 0.096 | 0.161 → 0.137 | 0.183 → 0.174 |
 | x86 (c3), 8 threads, one query per call | 0.397 → 0.286 | 0.450 → 0.439 | 0.538 → 0.507 |
 
-Through `k=100` every cell is faster or within 4% of the default scan; the cells at parity are multi-threaded single queries and x86 batches at the largest `k`.
+Through `k=100` every cell is faster or within 4% of the whole-index scan; the cells at parity are multi-threaded single queries and x86 batches at the largest `k`.
 
-**What stays on the default path.** 4-bit indexes; indexes below 32,768 vectors (an index that grows past the threshold switches then, and keeps the layout if it later shrinks); dimensions that are not a multiple of 32; x86 CPUs without AVX-512 VBMI and VNNI. Filtered searches use the two-stage path with a plain top-shortlist heap.
+**What scans the whole index instead.** Indexes below 32,768 vectors (an index that grows past the threshold switches then, and keeps the layout if it later shrinks); dimensions that are not a multiple of 32; x86 CPUs without AVX-512 VBMI and VNNI. Filtered searches use the two-stage path with a plain top-shortlist heap.
+
+---
+
+## Staged 4-bit search
+
+A 4-bit index of 32,768 vectors or more searches in stages. Nothing changes on disk: the file is the same whichever way it is searched. `TURBOVEC_4BIT_PLANES=0` in the environment before the process first searches keeps the whole-index exact scan instead; it is read once per process.
+
+A 4-bit code is a sign bit and three lower bits per coordinate. The in-memory search cache holds the four bit planes apart — the same bytes per vector, arranged differently — and a search
+
+1. scans the sign bits alone (a quarter of the bytes of a full scan) for a shortlist of `max(256, 20 × k)` candidates (`16 × k` from `k = 64`),
+2. ranks the shortlist with an estimate that adds the next bit plane and keeps the best `max(96, 6 × k)`,
+3. ranks those with all three lower planes, and
+4. rescores the best `max(32, 1.5 × k)` with the exact scan's own arithmetic.
+
+**Scores are exact; the candidate set is approximate.** Every returned score is bit-identical to what the whole-index scan returns for that id. What can differ is *which* ids are returned: a vector whose sign bits alone rank it outside the shortlist is not seen. On the corpora below the first stage keeps a wide margin:
+
+| data | queries returning exactly the whole-index scan's ids |
+|---|---|
+| OpenAI `text-embedding-3` d=1536 and d=3072, N=200K, k = 1, 10, 100 | 99.98–100% of 10,000 |
+| `all-mpnet-base-v2` d=768, N=41K, k = 1, 10, 100 | 99.92–100% of 10,000 |
+
+Recall against float ground truth on the OpenAI corpora is unchanged at every k the benchmark suite reports. Structureless random vectors are a different matter: with no real neighbours, a shortlist of sign bits misses the exact top-k for most queries. Check agreement on your own data if it is unlike the corpora above, and set `TURBOVEC_4BIT_PLANES=0` if the whole-index scan's id set is what you need.
+
+**How much faster.** Milliseconds per query on 100K OpenAI d=1536 vectors, whole-index scan → staged; batches are 1,000 queries in one call:
+
+| | k=10 | k=32 | k=64 | k=100 |
+|---|---|---|---|---|
+| ARM (c4a), 1 thread, batch | 0.985 → 0.741 | 1.012 → 0.800 | 1.052 → 0.872 | 1.105 → 0.956 |
+| ARM (c4a), 1 thread, one query per call | 3.58 → 0.95 | 3.62 → 1.01 | 3.70 → 1.09 | 3.86 → 1.19 |
+| ARM (c4a), 8 threads, batch | 0.111 → 0.094 | 0.126 → 0.101 | 0.135 → 0.112 | 0.133 → 0.123 |
+| ARM (c4a), 8 threads, one query per call | 0.506 → 0.179 | 0.514 → 0.214 | 0.553 → 0.235 | 0.606 → 0.270 |
+| x86 (c3), 1 thread, batch | 0.639 → 0.348 | 0.659 → 0.419 | 0.701 → 0.509 | 0.765 → 0.609 |
+| x86 (c3), 1 thread, one query per call | 3.34 → 0.73 | 3.35 → 0.82 | 3.45 → 0.92 | 3.47 → 0.96 |
+| x86 (c3), 8 threads, batch | 0.155 → 0.087 | 0.162 → 0.099 | 0.175 → 0.117 | 0.199 → 0.142 |
+| x86 (c3), 8 threads, one query per call | 0.999 → 0.303 | 1.010 → 0.327 | 1.066 → 0.401 | 1.137 → 0.470 |
+
+Every cell is faster: one query per call 2.25x–4.57x, batches 1.09x–1.84x (harmonic mean over the 32 cells 1.87x). A single query is where the full 4-bit scan is dearest, so that is where the staged search gains most; a batch already shares each block's bytes across queries, so its gain is the quarter-width first stage alone, and it shrinks as `k` grows. On 100K OpenAI d=3072 the same cells read 1.10x–5.65x (harmonic mean 1.83x on ARM, 2.27x on x86).
+
+**Small indexes.** The shortlist is sized by `k`, not by the index, so on an index of 40K vectors a `k=100` shortlist is 4% of it and the ranking stages cost a batch more than the shorter scan saves: measured on 40K vectors (OpenAI d=1536 cut down, and all-mpnet-base-v2 d=768 at 41K), batches at `k=100` run 0.80x–1.04x and at `k=64` 0.88x–1.15x of the whole-index scan, while every other cell is faster (one query per call 1.3x–3.7x; harmonic mean 1.3x–1.5x over the 16 cells). From about 64K vectors every cell is ahead.
+
+**What scans the whole index instead.** Indexes below 32,768 vectors (an index that grows past the threshold switches then, and keeps the layout if it later shrinks); dimensions that are not a multiple of 32; x86 CPUs without AVX-512 VBMI and VNNI. Filtered searches use the staged path with a plain top-shortlist heap.
 
 ---
 
